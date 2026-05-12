@@ -1,0 +1,422 @@
+# =============================================================================
+# Reality Intelligence Platform – Docker Compose (Development + Staging)
+# =============================================================================
+# Usage:
+#   make up         → start all services
+#   make up-gpu     → start with GPU support (docker-compose.gpu.yml overlay)
+#   make down       → stop all
+#   make logs       → tail logs
+# =============================================================================
+
+version: "3.9"
+
+x-common-env: &common-env
+  DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-rippassword}@postgres:5432/rip_db
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+  MINIO_SECURE: "false"
+  MINIO_BUCKET_MEDIA: rip-media
+  MINIO_BUCKET_MODELS: rip-models
+  MINIO_BUCKET_OUTPUTS: rip-outputs
+  SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production-32chars}
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  TRITON_SERVER_URL: triton:8001
+
+networks:
+  rip-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  mlflow-data:
+  colmap-workspace:
+  model-cache:
+
+services:
+  # ────────────────────────────────────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ────────────────────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [rip-net]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rippassword}
+      POSTGRES_DB: rip_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rip_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [rip-net]
+    volumes:
+      - redis-data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-18T22-51-28Z
+    restart: unless-stopped
+    networks: [rip-net]
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  minio-init:
+    image: minio/mc:latest
+    networks: [rip-net]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin};
+        mc mb --ignore-existing local/rip-media;
+        mc mb --ignore-existing local/rip-models;
+        mc mb --ignore-existing local/rip-outputs;
+        mc anonymous set download local/rip-outputs;
+        echo 'MinIO buckets initialised';
+      "
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # BACKEND API
+  # ────────────────────────────────────────────────────────────────────────────
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      PORT: 8000
+      WORKERS: 4
+      LOG_LEVEL: INFO
+    volumes:
+      - ./backend:/app:ro            # read-only bind for dev; remove in prod
+      - model-cache:/app/models
+      - colmap-workspace:/tmp/rip_sfm
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "prometheus.scrape=true"
+      - "prometheus.port=8000"
+      - "prometheus.path=/metrics"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # CELERY WORKERS
+  # ────────────────────────────────────────────────────────────────────────────
+
+  celery-worker-default:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      celery -A app.workers.tasks.celery_app worker
+        --loglevel=info
+        --queues=default,validation,analytics
+        --concurrency=4
+        --max-tasks-per-child=50
+        --hostname=worker-default@%h
+    environment:
+      <<: *common-env
+    volumes:
+      - model-cache:/app/models
+
+  celery-worker-frame:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      celery -A app.workers.tasks.celery_app worker
+        --loglevel=info
+        --queues=frame_extraction
+        --concurrency=8
+        --max-tasks-per-child=20
+        --hostname=worker-frame@%h
+    environment:
+      <<: *common-env
+    volumes:
+      - colmap-workspace:/tmp/rip_sfm
+
+  celery-worker-ml:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile.cpu
+      target: production
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      celery -A app.workers.tasks.celery_app worker
+        --loglevel=info
+        --queues=ml_gpu
+        --concurrency=2
+        --max-tasks-per-child=10
+        --hostname=worker-ml@%h
+    environment:
+      <<: *common-env
+      CUDA_VISIBLE_DEVICES: ""          # CPU mode; override in gpu compose
+    volumes:
+      - model-cache:/app/models
+      - colmap-workspace:/tmp/rip_sfm
+
+  celery-worker-recon:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile.cpu
+      target: production
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      celery -A app.workers.tasks.celery_app worker
+        --loglevel=info
+        --queues=reconstruction
+        --concurrency=1
+        --max-tasks-per-child=5
+        --hostname=worker-recon@%h
+    environment:
+      <<: *common-env
+    volumes:
+      - colmap-workspace:/tmp/rip_sfm
+      - model-cache:/app/models
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      celery -A app.workers.tasks.celery_app beat
+        --loglevel=info
+        --scheduler=celery.beat:PersistentScheduler
+    environment:
+      <<: *common-env
+
+  flower:
+    image: mher/flower:2.0
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - redis
+    command: >
+      celery flower
+        --broker=redis://redis:6379/1
+        --port=5555
+        --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    ports:
+      - "5555:5555"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # FRONTEND
+  # ────────────────────────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: ${FRONTEND_TARGET:-production}
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000/api/v1}
+        VITE_WS_URL:  ${VITE_WS_URL:-ws://localhost:8000/ws}
+    restart: unless-stopped
+    networks: [rip-net]
+    ports:
+      - "3000:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # NGINX REVERSE PROXY
+  # ────────────────────────────────────────────────────────────────────────────
+
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - backend
+      - frontend
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./docker/nginx/certs:/etc/nginx/certs:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # MLOPS
+  # ────────────────────────────────────────────────────────────────────────────
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - postgres
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri postgresql://postgres:${POSTGRES_PASSWORD:-rippassword}@postgres:5432/mlflow_db
+        --default-artifact-root s3://rip-models/mlflow
+        --artifacts-destination s3://rip-models/mlflow
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # MONITORING
+  # ────────────────────────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.49.1
+    restart: unless-stopped
+    networks: [rip-net]
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:10.3.1
+    restart: unless-stopped
+    networks: [rip-net]
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/rip_overview.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    restart: unless-stopped
+    networks: [rip-net]
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.56.0
+    restart: unless-stopped
+    networks: [rip-net]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    ports:
+      - "9121:9121"
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    networks: [rip-net]
+    environment:
+      DATA_SOURCE_NAME: postgresql://postgres:${POSTGRES_PASSWORD:-rippassword}@postgres:5432/rip_db?sslmode=disable
+    ports:
+      - "9187:9187"

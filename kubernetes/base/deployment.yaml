@@ -1,0 +1,599 @@
+# =============================================================================
+# Reality Intelligence Platform – Kubernetes Production Manifests
+# =============================================================================
+# Apply with: kubectl apply -k kubernetes/overlays/production
+# Or Helm:    helm install rip ./kubernetes/helm/rip -n rip-production
+# =============================================================================
+
+---
+# ── Namespace ─────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rip-production
+  labels:
+    app.kubernetes.io/managed-by: helm
+    environment: production
+
+---
+# ── ConfigMap – shared non-secret config ──────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rip-config
+  namespace: rip-production
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  PORT: "8000"
+  WORKERS: "4"
+  API_V1_PREFIX: "/api/v1"
+  FRAME_EXTRACTION_FPS: "2.0"
+  BLUR_THRESHOLD: "100.0"
+  SSIM_THRESHOLD: "0.95"
+  MAX_FRAMES_PER_VIDEO: "5000"
+  RECONSTRUCTION_QUALITY: "high"
+  MINIO_BUCKET_MEDIA: "rip-media"
+  MINIO_BUCKET_MODELS: "rip-models"
+  MINIO_BUCKET_OUTPUTS: "rip-outputs"
+  PROMETHEUS_ENABLED: "true"
+
+---
+# ── Secret – sensitive credentials (base64 encoded) ──────────────────────────
+# In production, use Kubernetes Secrets managed by Vault or AWS Secrets Manager
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rip-secrets
+  namespace: rip-production
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql+asyncpg://postgres:CHANGE_ME@postgres-service:5432/rip_db"
+  REDIS_URL: "redis://:CHANGE_ME@redis-service:6379/0"
+  CELERY_BROKER_URL: "redis://:CHANGE_ME@redis-service:6379/1"
+  CELERY_RESULT_BACKEND: "redis://:CHANGE_ME@redis-service:6379/2"
+  SECRET_KEY: "CHANGE_ME_minimum_32_chars_production_key"
+  MINIO_ACCESS_KEY: "CHANGE_ME"
+  MINIO_SECRET_KEY: "CHANGE_ME"
+  WANDB_API_KEY: "CHANGE_ME"
+  SENTRY_DSN: "CHANGE_ME"
+
+---
+# ── Backend API Deployment ────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: rip-production
+  labels:
+    app: backend
+    component: api
+    version: "1.0.0"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: rip-backend
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 60
+
+      initContainers:
+        - name: run-migrations
+          image: ghcr.io/your-org/rip-backend:latest
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef: {name: rip-config}
+            - secretRef:    {name: rip-secrets}
+
+      containers:
+        - name: backend
+          image: ghcr.io/your-org/rip-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+
+          envFrom:
+            - configMapRef: {name: rip-config}
+            - secretRef:    {name: rip-secrets}
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+          volumeMounts:
+            - name: model-cache
+              mountPath: /app/models
+            - name: tmp-workspace
+              mountPath: /tmp/rip_sfm
+
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: rip-model-cache-pvc
+        - name: tmp-workspace
+          emptyDir:
+            sizeLimit: 50Gi
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: backend
+
+---
+# ── Backend Service ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: rip-production
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  type: ClusterIP
+
+---
+# ── Backend HPA ───────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: rip-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+---
+# ── ML Worker Deployment (CPU) ────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-worker-cpu
+  namespace: rip-production
+  labels:
+    app: ml-worker
+    variant: cpu
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: ml-worker
+      variant: cpu
+  template:
+    metadata:
+      labels:
+        app: ml-worker
+        variant: cpu
+    spec:
+      serviceAccountName: rip-ml-worker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      terminationGracePeriodSeconds: 300
+
+      containers:
+        - name: ml-worker
+          image: ghcr.io/your-org/rip-ml-worker:latest
+          imagePullPolicy: Always
+          command:
+            - celery
+            - -A
+            - app.workers.tasks.celery_app
+            - worker
+            - --loglevel=info
+            - --queues=frame_extraction,analytics,validation
+            - --concurrency=4
+            - --max-tasks-per-child=20
+            - --hostname=ml-cpu-$(POD_NAME)@%h
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CUDA_VISIBLE_DEVICES
+              value: ""
+
+          envFrom:
+            - configMapRef: {name: rip-config}
+            - secretRef:    {name: rip-secrets}
+
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "4Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+
+          livenessProbe:
+            exec:
+              command:
+                - celery
+                - -A
+                - app.workers.tasks.celery_app
+                - inspect
+                - ping
+                - -d
+                - ml-cpu-$(POD_NAME)@$(hostname)
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: model-cache
+              mountPath: /app/models
+            - name: sfm-workspace
+              mountPath: /tmp/rip_sfm
+
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: rip-model-cache-pvc
+        - name: sfm-workspace
+          emptyDir:
+            sizeLimit: 200Gi
+
+---
+# ── ML Worker Deployment (GPU) ────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-worker-gpu
+  namespace: rip-production
+  labels:
+    app: ml-worker
+    variant: gpu
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ml-worker
+      variant: gpu
+  template:
+    metadata:
+      labels:
+        app: ml-worker
+        variant: gpu
+    spec:
+      serviceAccountName: rip-ml-worker
+      nodeSelector:
+        accelerator: nvidia-a100
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 600
+
+      containers:
+        - name: ml-worker-gpu
+          image: ghcr.io/your-org/rip-ml-worker:latest
+          imagePullPolicy: Always
+          command:
+            - celery
+            - -A
+            - app.workers.tasks.celery_app
+            - worker
+            - --loglevel=info
+            - --queues=ml_gpu,reconstruction
+            - --concurrency=2
+            - --max-tasks-per-child=10
+            - --hostname=ml-gpu-$(POD_NAME)@%h
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+
+          envFrom:
+            - configMapRef: {name: rip-config}
+            - secretRef:    {name: rip-secrets}
+
+          resources:
+            requests:
+              cpu: "4000m"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8000m"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+
+          volumeMounts:
+            - name: model-cache
+              mountPath: /app/models
+            - name: sfm-workspace
+              mountPath: /tmp/rip_sfm
+            - name: shm
+              mountPath: /dev/shm
+
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: rip-model-cache-pvc
+        - name: sfm-workspace
+          persistentVolumeClaim:
+            claimName: rip-sfm-workspace-pvc
+        - name: shm              # Shared memory for PyTorch DataLoader
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+
+---
+# ── Reconstruction Worker (single-pod, high-memory) ──────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconstruction-worker
+  namespace: rip-production
+  labels:
+    app: reconstruction-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reconstruction-worker
+  template:
+    metadata:
+      labels:
+        app: reconstruction-worker
+    spec:
+      nodeSelector:
+        workload-type: compute-intensive
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 3600
+
+      containers:
+        - name: recon-worker
+          image: ghcr.io/your-org/rip-ml-worker:latest
+          command:
+            - celery
+            - -A
+            - app.workers.tasks.celery_app
+            - worker
+            - --loglevel=info
+            - --queues=reconstruction
+            - --concurrency=1
+            - --max-tasks-per-child=3
+
+          envFrom:
+            - configMapRef: {name: rip-config}
+            - secretRef:    {name: rip-secrets}
+
+          resources:
+            requests:
+              cpu: "8000m"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16000m"
+              memory: "64Gi"
+              nvidia.com/gpu: "1"
+
+          volumeMounts:
+            - name: sfm-workspace
+              mountPath: /tmp/rip_sfm
+            - name: model-cache
+              mountPath: /app/models
+
+      volumes:
+        - name: sfm-workspace
+          persistentVolumeClaim:
+            claimName: rip-sfm-workspace-pvc
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: rip-model-cache-pvc
+
+---
+# ── Persistent Volume Claims ──────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rip-model-cache-pvc
+  namespace: rip-production
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: efs-sc          # AWS EFS for multi-pod access
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rip-sfm-workspace-pvc
+  namespace: rip-production
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 500Gi
+
+---
+# ── Ingress (NGINX Ingress Controller) ───────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rip-ingress
+  namespace: rip-production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-production
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "5g"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Frame-Options "SAMEORIGIN" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Strict-Transport-Security "max-age=63072000" always;
+spec:
+  tls:
+    - hosts:
+        - app.reality-intelligence.io
+        - api.reality-intelligence.io
+      secretName: rip-tls-cert
+  rules:
+    - host: api.reality-intelligence.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 8000
+    - host: app.reality-intelligence.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+
+---
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rip-backend
+  namespace: rip-production
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/rip-backend-role
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rip-ml-worker
+  namespace: rip-production
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/rip-ml-worker-role
+
+---
+# ── PodDisruptionBudget – ensure high availability ────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: rip-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: backend
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ml-worker-pdb
+  namespace: rip-production
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ml-worker

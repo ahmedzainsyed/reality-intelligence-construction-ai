@@ -1,0 +1,111 @@
+# =============================================================================
+# Reality Intelligence Platform – ML GPU Worker Dockerfile
+# Based on NVIDIA CUDA 11.8 + PyTorch 2.1 + Detectron2 + COLMAP
+# =============================================================================
+
+FROM nvcr.io/nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    CUDA_HOME=/usr/local/cuda \
+    PATH="/usr/local/cuda/bin:$PATH" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+
+# System packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3-pip python3.11-venv \
+    build-essential cmake ninja-build pkg-config git curl wget \
+    # OpenCV runtime
+    libgl1-mesa-glx libglib2.0-0 libsm6 libxrender1 libxext6 \
+    # COLMAP deps
+    colmap \
+    libboost-all-dev \
+    libeigen3-dev \
+    libflann-dev \
+    libfreeimage-dev \
+    libmetis-dev \
+    libgoogle-glog-dev \
+    libgflags-dev \
+    libsqlite3-dev \
+    libglew-dev \
+    qtbase5-dev \
+    libqt5opengl5-dev \
+    # Open3D deps
+    libgl1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1 && \
+    python3 -m pip install --upgrade pip setuptools wheel
+
+# ── PyTorch + CUDA ────────────────────────────────────────────────────────────
+FROM base AS torch
+
+RUN pip install --no-cache-dir \
+    torch==2.1.2+cu118 \
+    torchvision==0.16.2+cu118 \
+    torchaudio==2.1.2+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# ── Detectron2 ────────────────────────────────────────────────────────────────
+FROM torch AS detectron2
+
+RUN pip install --no-cache-dir \
+    "detectron2 @ git+https://github.com/facebookresearch/detectron2.git@v0.6#egg=detectron2" \
+    --no-build-isolation
+
+# ── ML & CV Libraries ─────────────────────────────────────────────────────────
+FROM detectron2 AS ml-deps
+
+COPY requirements.gpu.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.gpu.txt
+
+# Install Ultralytics (YOLOv8)
+RUN pip install --no-cache-dir ultralytics==8.1.0
+
+# Install Open3D
+RUN pip install --no-cache-dir open3d==0.18.0
+
+# Install SAM
+RUN pip install --no-cache-dir git+https://github.com/facebookresearch/segment-anything.git
+
+# ONNX Runtime GPU
+RUN pip install --no-cache-dir onnxruntime-gpu==1.17.1
+
+# TensorRT Python bindings (requires TensorRT to be installed on host)
+RUN pip install --no-cache-dir tensorrt==8.6.1.post1 || echo "TensorRT install skipped"
+
+# ── Production stage ──────────────────────────────────────────────────────────
+FROM ml-deps AS production
+
+RUN groupadd --gid 1001 mluser && \
+    useradd --uid 1001 --gid 1001 --create-home mluser
+
+WORKDIR /app
+
+# Copy ML codebase
+COPY --chown=mluser:mluser ml/ ./ml/
+COPY --chown=mluser:mluser backend/app/ ./app/
+COPY --chown=mluser:mluser configs/ ./configs/
+
+# Pre-download model weights (optional; can be mounted instead)
+# RUN python3 -c "from ultralytics import YOLO; YOLO('yolov8l.pt')"
+
+RUN mkdir -p /app/models /app/outputs /tmp/rip_sfm && \
+    chown -R mluser:mluser /app /tmp/rip_sfm
+
+USER mluser
+
+ENV PYTHONPATH=/app \
+    TORCH_HOME=/app/models/.torch \
+    ULTRALYTICS_SETTINGS_DIR=/app/models/.ultralytics
+
+# Default: run Celery ML GPU worker
+CMD ["celery", "-A", "app.workers.tasks.celery_app", "worker", \
+     "--loglevel=info", \
+     "--queues=ml_gpu,reconstruction", \
+     "--concurrency=2", \
+     "--max-tasks-per-child=10", \
+     "--hostname=ml-gpu-worker@%h"]
