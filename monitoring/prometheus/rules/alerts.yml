@@ -1,0 +1,255 @@
+# =============================================================================
+# Reality Intelligence Platform – Alerting Rules
+# =============================================================================
+
+groups:
+
+  # ── API Availability ────────────────────────────────────────────────────────
+  - name: api_availability
+    interval: 30s
+    rules:
+
+      - alert: APIHighErrorRate
+        expr: |
+          sum(rate(rip_http_requests_total{status_code=~"5.."}[5m]))
+          /
+          sum(rate(rip_http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "API error rate > 5%"
+          description: "Error rate is {{ $value | humanizePercentage }} over last 5m"
+          runbook: "https://docs.reality-intelligence.io/runbooks/api-errors"
+
+      - alert: APIHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(rip_http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "API P95 latency > 2s on {{ $labels.endpoint }}"
+          description: "P95 latency is {{ $value }}s"
+
+      - alert: APIDown
+        expr: up{job="rip-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: backend
+          pagerduty: "true"
+        annotations:
+          summary: "RIP Backend API is DOWN"
+          description: "Backend API has been unreachable for 1 minute"
+
+      - alert: APIHighRequestRate
+        expr: sum(rate(rip_http_requests_total[1m])) > 500
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Unusual API request rate: {{ $value | humanize }} req/s"
+
+  # ── Celery / Task Queue ─────────────────────────────────────────────────────
+  - name: task_queue
+    interval: 30s
+    rules:
+
+      - alert: CeleryQueueBacklog
+        expr: celery_queue_length{queue="ml_gpu"} > 50
+        for: 10m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "ML GPU queue backlog: {{ $value }} tasks"
+          description: "GPU queue has been backed up for >10 minutes. Consider scaling GPU workers."
+
+      - alert: CeleryReconQueueBacklog
+        expr: celery_queue_length{queue="reconstruction"} > 10
+        for: 15m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Reconstruction queue backlog: {{ $value }} tasks"
+
+      - alert: CeleryWorkerDown
+        expr: celery_workers_total < 2
+        for: 5m
+        labels:
+          severity: critical
+          team: ml
+          pagerduty: "true"
+        annotations:
+          summary: "Fewer than 2 Celery workers running ({{ $value }})"
+
+      - alert: TaskHighFailureRate
+        expr: |
+          sum(rate(celery_task_failed_total[10m]))
+          /
+          sum(rate(celery_task_succeeded_total[10m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Task failure rate > 10%: {{ $value | humanizePercentage }}"
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+  - name: infrastructure
+    interval: 30s
+    rules:
+
+      - alert: HighCPU
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}: {{ $value | humanize }}%"
+
+      - alert: HighMemory
+        expr: |
+          (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: "Critical memory on {{ $labels.instance }}: {{ $value | humanize }}%"
+
+      - alert: DiskSpaceCritical
+        expr: |
+          (1 - node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+          team: infra
+          pagerduty: "true"
+        annotations:
+          summary: "Disk space critical on {{ $labels.instance }} ({{ $labels.mountpoint }}): {{ $value | humanize }}%"
+
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: infra
+          pagerduty: "true"
+        annotations:
+          summary: "PostgreSQL is DOWN"
+
+      - alert: PostgreSQLHighConnections
+        expr: sum(pg_stat_activity_count) > 150
+        for: 5m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "High PostgreSQL connections: {{ $value }}"
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: infra
+          pagerduty: "true"
+        annotations:
+          summary: "Redis is DOWN"
+
+      - alert: RedisHighMemory
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Redis memory usage > 85%: {{ $value | humanizePercentage }}"
+
+  # ── GPU Monitoring ──────────────────────────────────────────────────────────
+  - name: gpu_monitoring
+    interval: 30s
+    rules:
+
+      - alert: GPUHighTemperature
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "GPU {{ $labels.gpu }} temperature: {{ $value }}°C"
+
+      - alert: GPUCriticalTemperature
+        expr: DCGM_FI_DEV_GPU_TEMP > 95
+        for: 2m
+        labels:
+          severity: critical
+          team: ml
+          pagerduty: "true"
+        annotations:
+          summary: "CRITICAL: GPU {{ $labels.gpu }} temperature: {{ $value }}°C – throttling likely"
+
+      - alert: GPULowUtilization
+        expr: DCGM_FI_DEV_GPU_UTIL < 20 and celery_queue_length{queue="ml_gpu"} > 5
+        for: 15m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "GPU {{ $labels.gpu }} utilisation low ({{ $value }}%) despite queue backlog"
+
+      - alert: GPUMemoryHigh
+        expr: DCGM_FI_DEV_MEM_COPY_UTIL > 90
+        for: 10m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "GPU {{ $labels.gpu }} memory utilisation: {{ $value }}%"
+
+  # ── Business / ML KPIs ──────────────────────────────────────────────────────
+  - name: business_kpis
+    interval: 60s
+    rules:
+
+      - alert: ReconstructionJobStalled
+        expr: |
+          (time() - rip_reconstruction_last_completed_timestamp) > 7200
+          and rip_reconstruction_jobs_pending > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "No reconstruction completed in 2h despite {{ $value }} pending jobs"
+
+      - alert: StorageHighUsage
+        expr: minio_cluster_capacity_usable_free_bytes / minio_cluster_capacity_usable_total_bytes < 0.15
+        for: 30m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "MinIO storage < 15% free – {{ $value | humanizePercentage }} remaining"
+
+      - alert: UploadFailureRateHigh
+        expr: |
+          sum(rate(rip_http_requests_total{endpoint="/api/v1/uploads/video",status_code=~"4..|5.."}[15m]))
+          /
+          sum(rate(rip_http_requests_total{endpoint="/api/v1/uploads/video"}[15m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Upload failure rate > 20%: {{ $value | humanizePercentage }}"

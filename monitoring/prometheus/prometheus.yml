@@ -1,0 +1,107 @@
+# =============================================================================
+# Reality Intelligence Platform – Prometheus Configuration
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: rip-production
+    environment: production
+
+# Alertmanager
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager:9093]
+
+# Load alerting rules
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# =============================================================================
+# SCRAPE CONFIGS
+# =============================================================================
+scrape_configs:
+
+  # ── Prometheus self-monitoring ─────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  # ── Backend API ────────────────────────────────────────────────────────────
+  - job_name: rip-backend
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets: [backend:8000]
+        labels:
+          service: backend
+          component: api
+    # Kubernetes SD alternative:
+    # kubernetes_sd_configs:
+    #   - role: pod
+    #     namespaces:
+    #       names: [rip-production]
+    # relabel_configs:
+    #   - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+    #     action: keep
+    #     regex: "true"
+
+  # ── Celery Workers (via Flower API) ───────────────────────────────────────
+  - job_name: celery-flower
+    metrics_path: /metrics
+    static_configs:
+      - targets: [flower:5555]
+        labels:
+          service: celery
+          component: worker
+
+  # ── Node Exporter ─────────────────────────────────────────────────────────
+  - job_name: node-exporter
+    static_configs:
+      - targets: [node-exporter:9100]
+        labels:
+          service: infrastructure
+          component: node
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  - job_name: redis
+    static_configs:
+      - targets: [redis-exporter:9121]
+        labels:
+          service: infrastructure
+          component: redis
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  - job_name: postgres
+    static_configs:
+      - targets: [postgres-exporter:9187]
+        labels:
+          service: infrastructure
+          component: database
+
+  # ── MinIO ─────────────────────────────────────────────────────────────────
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: [minio:9000]
+        labels:
+          service: infrastructure
+          component: storage
+
+  # ── NGINX ─────────────────────────────────────────────────────────────────
+  - job_name: nginx
+    static_configs:
+      - targets: [nginx-exporter:9113]
+        labels:
+          service: infrastructure
+          component: nginx
+
+  # ── NVIDIA GPU ────────────────────────────────────────────────────────────
+  - job_name: nvidia-gpu
+    static_configs:
+      - targets: [nvidia-dcgm-exporter:9400]
+        labels:
+          service: ml
+          component: gpu

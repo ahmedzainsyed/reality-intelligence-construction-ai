@@ -1,0 +1,76 @@
+# =============================================================================
+# DeepLabV3+ Construction Segmentation – Training Configuration
+# =============================================================================
+
+model:
+  backbone: resnet101
+  output_stride: 16
+  num_classes: 13           # See ml/segmentation/pipeline.py CONSTRUCTION_CLASSES
+  pretrained_backbone: true
+  aspp_dilations: [6, 12, 18]
+  dropout_rate: 0.5
+
+training:
+  epochs: 150
+  batch_size: 8
+  image_size: [512, 512]
+  num_workers: 8
+  pin_memory: true
+
+  # Optimiser
+  optimizer: AdamW
+  learning_rate: 0.0001
+  weight_decay: 0.0005
+  lr_scheduler: polynomial
+  lr_power: 0.9
+
+  # Loss
+  loss: cross_entropy
+  class_weights:            # Boost rare classes
+    background: 0.5
+    concrete_structure: 1.0
+    soil_excavation: 1.2
+    steel_rebar: 2.5        # Small, easy to miss
+    formwork_timber: 1.5
+    scaffolding: 1.5
+    active_work_zone: 2.0
+    hazard_zone: 3.0        # Safety-critical
+    sky: 0.5
+    vegetation: 0.7
+    machinery_area: 1.5
+    material_storage: 1.2
+    road_pathway: 0.8
+
+  # Precision
+  mixed_precision: true
+
+augmentation:
+  random_horizontal_flip: 0.5
+  random_vertical_flip: 0.05
+  random_rotation: [-10, 10]
+  random_scale: [0.75, 1.5]
+  random_crop: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.1
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+validation:
+  metrics: [mIoU, pixel_accuracy, class_accuracy]
+  val_interval: 5           # Validate every N epochs
+
+output:
+  project: outputs/segmentation
+  checkpoint_interval: 10
+  save_best: true
+
+mlflow:
+  experiment: deeplabv3-construction
+  tags:
+    model: deeplabv3plus
+    backbone: resnet101
+    task: semantic_segmentation

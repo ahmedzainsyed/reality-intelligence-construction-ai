@@ -1,0 +1,36 @@
+# =============================================================================
+# Grafana Datasource Provisioning
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    uid: DS_PROMETHEUS
+    jsonData:
+      timeInterval: "15s"
+      queryTimeout: "60s"
+      httpMethod: "POST"
+    version: 1
+    editable: false
+
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: rip_db
+    user: grafana_readonly
+    secureJsonData:
+      password: "${POSTGRES_GRAFANA_PASSWORD}"
+    jsonData:
+      sslmode: "disable"
+      maxOpenConns: 5
+      maxIdleConns: 2
+      postgresVersion: 1600
+      timescaledb: false
+    version: 1
+    editable: false
